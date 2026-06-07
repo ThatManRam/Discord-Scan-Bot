@@ -4,6 +4,7 @@ import os
 from discord.ext import commands
 import asyncio
 import time
+import signal
 
 load_dotenv()
 
@@ -22,11 +23,11 @@ if not TOKEN:
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.voice_states = True
 
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 
 scan_process = None
+scan_stopping = False
 
 
 @bot.event
@@ -34,14 +35,18 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
 
 
+def is_allowed(ctx):
+    return str(ctx.author.id) in ALLOWED_USER_IDS
+
+
 @bot.command()
 async def scan(ctx):
-    global scan_process
+    global scan_process, scan_stopping
 
     if ctx.author == bot.user:
         return
 
-    if str(ctx.author.id) not in ALLOWED_USER_IDS:
+    if not is_allowed(ctx):
         await ctx.channel.send("User not allowed.")
         return
 
@@ -49,27 +54,43 @@ async def scan(ctx):
         await ctx.channel.send("A scan is already running.")
         return
 
+    scan_stopping = False
     await ctx.channel.send("Starting ZMap scan...")
 
-    # Removed -q because it hides progress/output
     command = "zmap -i tun0 --iplayer -p 443 -r 50 -q"
 
-    scan_process = await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
+    try:
+        scan_process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            preexec_fn=os.setsid
+        )
+    except Exception as e:
+        scan_process = None
+        await ctx.channel.send(f"Failed to start ZMap:\n```text\n{e}\n```")
+        return
 
     last_send = 0
     output_buffer = []
 
     async def read_stream(stream, name):
         nonlocal last_send, output_buffer
+        global scan_stopping
 
         while True:
-            line = await stream.readline()
+            if scan_stopping:
+                break
+
+            try:
+                line = await stream.readline()
+            except Exception:
+                break
 
             if not line:
+                break
+
+            if scan_stopping:
                 break
 
             text = line.decode(errors="replace").strip()
@@ -78,12 +99,10 @@ async def scan(ctx):
                 continue
 
             print(f"[{name}] {text}")
-
             output_buffer.append(text)
 
             now = time.time()
 
-            # Send output every 5 seconds to avoid Discord rate limits
             if now - last_send >= 5:
                 last_send = now
 
@@ -92,42 +111,57 @@ async def scan(ctx):
                 if len(message) > 1900:
                     message = message[-1900:]
 
-                await ctx.channel.send(f"```text\n{message}\n```")
+                if not scan_stopping:
+                    await ctx.channel.send(f"```text\n{message}\n```")
 
-    await asyncio.gather(
-        read_stream(scan_process.stdout, "STDOUT"),
-        read_stream(scan_process.stderr, "STDERR")
-    )
-
-    return_code = await scan_process.wait()
-
-    if output_buffer:
-        final_output = "\n".join(output_buffer[-20:])
-
-        if len(final_output) > 1900:
-            final_output = final_output[-1900:]
-
-        await ctx.channel.send(
-            f"ZMap finished with code `{return_code}`.\n"
-            f"Final output:\n```text\n{final_output}\n```"
+    try:
+        await asyncio.gather(
+            read_stream(scan_process.stdout, "STDOUT"),
+            read_stream(scan_process.stderr, "STDERR")
         )
-    else:
-        await ctx.channel.send(f"ZMap finished with code `{return_code}`, but no output was captured.")
 
-    scan_process = None
+        return_code = await scan_process.wait()
+
+        if scan_stopping:
+            await ctx.channel.send("Scan stopped.")
+        elif output_buffer:
+            final_output = "\n".join(output_buffer[-20:])
+
+            if len(final_output) > 1900:
+                final_output = final_output[-1900:]
+
+            await ctx.channel.send(
+                f"ZMap finished with code `{return_code}`.\n"
+                f"Final output:\n```text\n{final_output}\n```"
+            )
+        else:
+            await ctx.channel.send(
+                f"ZMap finished with code `{return_code}`, but no output was captured."
+            )
+
+    finally:
+        scan_process = None
+        scan_stopping = False
 
 
 @bot.command()
 async def stop(ctx):
-    global scan_process
+    global scan_process, scan_stopping
 
-    if str(ctx.author.id) not in ALLOWED_USER_IDS:
+    if not is_allowed(ctx):
         await ctx.channel.send("User not allowed.")
         return
 
     if scan_process and scan_process.returncode is None:
-        scan_process.terminate()
-        await ctx.channel.send("Scanning ended.")
+        scan_stopping = True
+
+        try:
+            os.killpg(os.getpgid(scan_process.pid), signal.SIGTERM)
+            await ctx.channel.send("Stopping scan...")
+        except ProcessLookupError:
+            await ctx.channel.send("Scan already stopped.")
+        except Exception as e:
+            await ctx.channel.send(f"Error stopping scan:\n```text\n{e}\n```")
     else:
         await ctx.channel.send("No scan is currently running.")
 
