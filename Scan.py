@@ -61,11 +61,11 @@ async def scan(ctx):
 
     try:
         scan_process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            preexec_fn=os.setsid
-        )
+        *shlex.split(command),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        preexec_fn=os.setsid
+    )
     except Exception as e:
         scan_process = None
         await ctx.channel.send(f"Failed to start ZMap:\n```text\n{e}\n```")
